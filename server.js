@@ -1,92 +1,207 @@
 const { Server } = require("socket.io");
-
-// Render uses the PORT environment variable to tell Node where to listen
 const port = process.env.PORT || 3000;
-
-const io = new Server({
-    cors: {
-        origin: "*", // allow connections from anywhere
-        methods: ["GET", "POST"]
-    }
+const io = new Server({ 
+    cors: { 
+        origin: "*", 
+        methods: ["GET", "POST"] 
+    } 
 });
 
-// Track available AI DJs (Agents)
+// Track available agents
 let availableAgents = [];
+
+// Track device assignments: deviceId -> { agentName, roomId }
+const deviceAssignments = new Map();
+
+// Manager socket
+let managerSocket = null;
+
+// Pending devices waiting for agent assignment
+const pendingDevices = new Map();
 
 io.on("connection", (socket) => {
     console.log(`🔌 New connection: ${socket.id}`);
 
-    // --- AGENT LOGIC (The AI DJ) ---
-    socket.on('register-agent', () => {
-        // Prevent duplicate registrations
-        if (!availableAgents.includes(socket.id)) {
-            availableAgents.push(socket.id);
-            socket.isAgent = true; // Tag it
-            console.log(`🤖 Agent Registered: ${socket.id}. Total Available: ${availableAgents.length}`);
+    // --- MANAGER LOGIC ---
+    socket.on('manager-register', () => {
+        managerSocket = socket;
+        socket.isManager = true;
+        console.log(`📋 Manager registered: ${socket.id}`);
+        
+        // Send any pending devices
+        pendingDevices.forEach((device, id) => {
+            socket.emit('device-connecting', device);
+        });
+    });
+
+    // --- AGENT LOGIC ---
+    socket.on('register-agent', (data = {}) => {
+        const agentInfo = {
+            id: socket.id,
+            name: data.name || 'agent',
+            deviceId: data.deviceId || null
+        };
+        
+        // Remove existing registration if any
+        availableAgents = availableAgents.filter(a => a.id !== socket.id);
+        availableAgents.push(agentInfo);
+        
+        socket.isAgent = true;
+        socket.agentName = agentInfo.name;
+        
+        console.log(`🤖 Agent Registered: ${agentInfo.name} (${socket.id}). Pool: ${availableAgents.length}`);
+        
+        // If this agent was assigned to a device, connect them
+        if (agentInfo.deviceId && deviceAssignments.has(agentInfo.deviceId)) {
+            const assignment = deviceAssignments.get(agentInfo.deviceId);
+            matchAgentToDevice(socket, agentInfo, assignment.deviceId);
         }
     });
 
     // --- CLIENT LOGIC (Dextral Player) ---
-    socket.on('request-agent', () => {
-        console.log(`🎧 Client ${socket.id} requesting an Agent...`);
-
-        if (availableAgents.length === 0) {
-            console.log(`⚠️ No agents available for Client ${socket.id}. Telling client to wait.`);
-            socket.emit('match-failed', { error: 'No AI DJs are currently online.' });
-            return;
+    socket.on('request-agent', (data = {}) => {
+        const deviceId = socket.id;
+        const deviceName = data.deviceName || `Device-${deviceId.substr(0, 6)}`;
+        
+        console.log(`🎧 ${deviceName} (${deviceId}) requesting agent...`);
+        
+        // Store pending device
+        const deviceInfo = {
+            id: deviceId,
+            deviceName: deviceName,
+            requestedAt: Date.now()
+        };
+        pendingDevices.set(deviceId, deviceInfo);
+        
+        // Notify manager
+        if (managerSocket) {
+            managerSocket.emit('device-connecting', deviceInfo);
         }
-
-        // Pop an Agent off the pool
-        const assignedAgentId = availableAgents.shift();
-
-        // Generate a unique 1-on-1 private room ID based on the Client
-        const privateRoomId = `session_${socket.id.substring(0, 8)}`;
-
-        // Put both the Client and the assigned Agent into the private room
-        socket.join(privateRoomId);
-
-        // The Agent socket object might not be accessible directly if we scale,
-        // but for a single Node instance, we can instruct the specific agent to join:
-        const agentSocket = io.sockets.sockets.get(assignedAgentId);
-
-        if (agentSocket) {
-            agentSocket.join(privateRoomId);
-            console.log(`🤝 Matched! Agent ${assignedAgentId} assigned to Client ${socket.id} in room: ${privateRoomId}`);
-
-            // Tell the Agent it was assigned to a session so it can generate the WebRTC Offer
-            agentSocket.emit('agent-assigned', { roomId: privateRoomId, clientId: socket.id });
-
-            // Tell the Client they got an Agent
-            socket.emit('agent-found', { roomId: privateRoomId });
-        } else {
-            // Edge case: Agent dropped offline the exact millisecond we popped it
-            console.log(`❌ Agent ${assignedAgentId} disappeared before matchmaking could finish!`);
-            socket.emit('match-failed', { error: 'Assigned Agent dropped offline. Try again.' });
-        }
-    });
-
-    // --- WEBRTC SIGNALING (For both Agents and Clients inside their private room) ---
-    socket.on('signal', (data) => {
-        // data contains { roomId, signalData, senderId }
-        // We broadcast it to the EXACT room, but io.to() handles that securely.
-        socket.to(data.roomId).emit('signal', {
-            signalData: data.signalData,
-            senderId: data.senderId
+        
+        // Tell device to wait
+        socket.emit('waiting-for-agent', { 
+            message: 'Connecting you to a DJ...' 
         });
     });
 
-    // --- DISCONNECT HANDLING ---
-    socket.on("disconnect", () => {
-        console.log(`❌ Disconnected: ${socket.id}`);
+    // --- MANAGER: ASSIGN AGENT ---
+    socket.on('assign-agent', (data) => {
+        const { deviceId, agentName } = data;
+        
+        if (!pendingDevices.has(deviceId)) {
+            console.log(`❌ No pending device: ${deviceId}`);
+            return;
+        }
+        
+        const deviceSocket = io.sockets.sockets.get(deviceId);
+        if (!deviceSocket) {
+            console.log(`❌ Device ${deviceId} disconnected`);
+            pendingDevices.delete(deviceId);
+            return;
+        }
+        
+        const roomId = `session_${deviceId.substr(0, 8)}_${Date.now()}`;
+        
+        // Store assignment
+        deviceAssignments.set(deviceId, {
+            agentName: agentName,
+            roomId: roomId
+        });
+        
+        // Notify device
+        deviceSocket.emit('agent-assigned', {
+            agentName: agentName,
+            roomId: roomId,
+            message: `You're being connected to ${agentName}`
+        });
+        
+        // Notify manager
+        if (managerSocket) {
+            managerSocket.emit('agent-assigned', {
+                deviceId: deviceId,
+                agentName: agentName,
+                roomId: roomId
+            });
+        }
+        
+        pendingDevices.delete(deviceId);
+        
+        console.log(`✅ Assigned ${agentName} to device ${deviceId}`);
+    });
 
-        // If an Agent disconnected, remove them from the available pool
-        if (socket.isAgent) {
-            availableAgents = availableAgents.filter(id => id !== socket.id);
-            console.log(`🗑️ Agent ${socket.id} removed from pool. Total Available: ${availableAgents.length}`);
+    // --- AGENT: CONNECT TO ASSIGNED DEVICE ---
+    socket.on('connect-to-device', (data) => {
+        const { deviceId } = data;
+        
+        if (deviceAssignments.has(deviceId)) {
+            const assignment = deviceAssignments.get(deviceId);
+            const agentInfo = availableAgents.find(a => a.id === socket.id);
+            if (agentInfo) {
+                matchAgentToDevice(socket, agentInfo, deviceId);
+            }
         }
     });
 
-}); // Close io.on('connection')
+    // --- SIGNALING ---
+    socket.on('signal', (data) => {
+        socket.to(data.roomId).emit('signal', { 
+            signalData: data.signalData, 
+            senderId: data.senderId 
+        });
+    });
+
+    // --- DISCONNECT ---
+    socket.on("disconnect", () => {
+        console.log(`❌ Disconnected: ${socket.id}`);
+        
+        if (socket.isManager) {
+            managerSocket = null;
+        }
+        
+        if (socket.isAgent) {
+            availableAgents = availableAgents.filter(a => a.id !== socket.id);
+            console.log(`🗑️ Agent ${socket.agentName} removed. Pool: ${availableAgents.length}`);
+        }
+        
+        // Clean up pending device
+        if (pendingDevices.has(socket.id)) {
+            pendingDevices.delete(socket.id);
+            if (managerSocket) {
+                managerSocket.emit('device-disconnected', { deviceId: socket.id });
+            }
+        }
+        
+        deviceAssignments.delete(socket.id);
+    });
+});
+
+function matchAgentToDevice(agentSocket, agentInfo, deviceId) {
+    const assignment = deviceAssignments.get(deviceId);
+    if (!assignment) return;
+    
+    const deviceSocket = io.sockets.sockets.get(deviceId);
+    if (!deviceSocket) {
+        console.log(`❌ Device ${deviceId} gone`);
+        return;
+    }
+    
+    const roomId = assignment.roomId;
+    
+    agentSocket.join(roomId);
+    deviceSocket.join(roomId);
+    
+    agentSocket.emit('agent-connected', { 
+        roomId: roomId, 
+        clientId: deviceId 
+    });
+    
+    deviceSocket.emit('agent-connected', {
+        roomId: roomId,
+        agentName: agentInfo.name
+    });
+    
+    console.log(`🤝 ${agentInfo.name} connected to device ${deviceId}`);
+}
 
 io.listen(port);
 console.log(`🚀 Dextral Relay Server running on port ${port}`);
