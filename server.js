@@ -32,6 +32,31 @@ io.on("connection", (socket) => {
         pendingDevices.forEach((device, id) => {
             socket.emit('device-connecting', device);
         });
+        
+        // Send current active connections
+        deviceAssignments.forEach((assignment, deviceId) => {
+            socket.emit('active-connection', {
+                deviceId: deviceId,
+                agentName: assignment.agentName,
+                roomId: assignment.roomId
+            });
+        });
+    });
+    
+    // Manager asking for current state
+    socket.on('get-state', () => {
+        const state = {
+            pending: Array.from(pendingDevices.values()),
+            active: []
+        };
+        deviceAssignments.forEach((assignment, deviceId) => {
+            state.active.push({
+                deviceId: deviceId,
+                agentName: assignment.agentName,
+                roomId: assignment.roomId
+            });
+        });
+        socket.emit('state', state);
     });
 
     // --- AGENT LOGIC ---
