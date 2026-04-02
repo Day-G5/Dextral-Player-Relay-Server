@@ -1,17 +1,18 @@
 const { Server } = require("socket.io");
 const port = process.env.PORT || 3000;
-const io = new Server({ 
-    cors: { 
-        origin: "*", 
-        methods: ["GET", "POST"] 
-    } 
+const io = new Server({
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
 });
 
-// Track available agents
-let availableAgents = [];
 
 // Track device assignments: deviceId -> { agentName, roomId }
 const deviceAssignments = new Map();
+// Stable device ID routing
+const socketToDeviceId = new Map();
+const deviceIdToSocketId = new Map();
 
 // Manager socket
 let managerSocket = null;
@@ -27,12 +28,12 @@ io.on("connection", (socket) => {
         managerSocket = socket;
         socket.isManager = true;
         console.log(`📋 Manager registered: ${socket.id}`);
-        
+
         // Send any pending devices
         pendingDevices.forEach((device, id) => {
             socket.emit('device-connecting', device);
         });
-        
+
         // Send current active connections
         deviceAssignments.forEach((assignment, deviceId) => {
             socket.emit('active-connection', {
@@ -42,7 +43,7 @@ io.on("connection", (socket) => {
             });
         });
     });
-    
+
     // Manager asking for current state
     socket.on('get-state', () => {
         const state = {
@@ -59,87 +60,69 @@ io.on("connection", (socket) => {
         socket.emit('state', state);
     });
 
-    // --- AGENT LOGIC ---
-    socket.on('register-agent', (data = {}) => {
-        const agentInfo = {
-            id: socket.id,
-            name: data.name || 'agent',
-            deviceId: data.deviceId || null
-        };
-        
-        // Remove existing registration if any
-        availableAgents = availableAgents.filter(a => a.id !== socket.id);
-        availableAgents.push(agentInfo);
-        
-        socket.isAgent = true;
-        socket.agentName = agentInfo.name;
-        
-        console.log(`🤖 Agent Registered: ${agentInfo.name} (${socket.id}). Pool: ${availableAgents.length}`);
-        
-        // If this agent was assigned to a device, connect them
-        if (agentInfo.deviceId && deviceAssignments.has(agentInfo.deviceId)) {
-            const assignment = deviceAssignments.get(agentInfo.deviceId);
-            matchAgentToDevice(socket, agentInfo, assignment.deviceId);
-        }
-    });
-
     // --- CLIENT LOGIC (Dextral Player) ---
     socket.on('request-agent', (data = {}) => {
-        const deviceId = socket.id;
-        const deviceName = data.deviceName || `Device-${deviceId.substr(0, 6)}`;
-        
-        console.log(`🎧 ${deviceName} (${deviceId}) requesting agent...`);
-        
+        const stableDeviceId = String(data.deviceId || socket.id);
+        const deviceName = data.deviceName || `Device-${stableDeviceId.substr(0, 6)}`;
+
+        console.log(`🎧 ${deviceName} (${stableDeviceId}) requesting agent...`);
+        socketToDeviceId.set(socket.id, stableDeviceId);
+        deviceIdToSocketId.set(stableDeviceId, socket.id);
+
         // Store pending device
         const deviceInfo = {
-            id: deviceId,
+            id: stableDeviceId,
+            socketId: socket.id,
             deviceName: deviceName,
             requestedAt: Date.now()
         };
-        pendingDevices.set(deviceId, deviceInfo);
-        
+        pendingDevices.set(stableDeviceId, deviceInfo);
+
         // Notify manager
         if (managerSocket) {
             managerSocket.emit('device-connecting', deviceInfo);
         }
-        
+
         // Tell device to wait
-        socket.emit('waiting-for-agent', { 
-            message: 'Connecting you to a DJ...' 
+        socket.emit('waiting-for-agent', {
+            message: 'Connecting you to a DJ...'
         });
     });
 
     // --- MANAGER: ASSIGN AGENT ---
     socket.on('assign-agent', (data) => {
         const { deviceId, agentName } = data;
-        
+
         if (!pendingDevices.has(deviceId)) {
             console.log(`❌ No pending device: ${deviceId}`);
             return;
         }
-        
-        const deviceSocket = io.sockets.sockets.get(deviceId);
+
+        const pendingDevice = pendingDevices.get(deviceId);
+        const targetSocketId = pendingDevice?.socketId || deviceIdToSocketId.get(deviceId);
+        const deviceSocket = io.sockets.sockets.get(targetSocketId);
         if (!deviceSocket) {
             console.log(`❌ Device ${deviceId} disconnected`);
             pendingDevices.delete(deviceId);
+            deviceIdToSocketId.delete(deviceId);
             return;
         }
-        
+
         const roomId = `session_${deviceId.substr(0, 8)}_${Date.now()}`;
-        
+
         // Store assignment
         deviceAssignments.set(deviceId, {
             agentName: agentName,
             roomId: roomId
         });
-        
+
         // Notify device
         deviceSocket.emit('agent-assigned', {
             agentName: agentName,
             roomId: roomId,
             message: `You're being connected to ${agentName}`
         });
-        
+
         // Notify manager
         if (managerSocket) {
             managerSocket.emit('agent-assigned', {
@@ -148,85 +131,64 @@ io.on("connection", (socket) => {
                 roomId: roomId
             });
         }
-        
-        pendingDevices.delete(deviceId);
-        
-        console.log(`✅ Assigned ${agentName} to device ${deviceId}`);
-    });
 
-    // --- AGENT: CONNECT TO ASSIGNED DEVICE ---
-    socket.on('connect-to-device', (data) => {
-        const { deviceId } = data;
-        
-        if (deviceAssignments.has(deviceId)) {
-            const assignment = deviceAssignments.get(deviceId);
-            const agentInfo = availableAgents.find(a => a.id === socket.id);
-            if (agentInfo) {
-                matchAgentToDevice(socket, agentInfo, deviceId);
-            }
-        }
+        pendingDevices.delete(deviceId);
+
+        console.log(`✅ Assigned ${agentName} to device ${deviceId}`);
     });
 
     // --- SIGNALING ---
     socket.on('signal', (data) => {
-        socket.to(data.roomId).emit('signal', { 
-            signalData: data.signalData, 
-            senderId: data.senderId 
+        socket.to(data.roomId).emit('signal', {
+            signalData: data.signalData,
+            senderId: data.senderId
         });
     });
 
     // --- DISCONNECT ---
     socket.on("disconnect", () => {
         console.log(`❌ Disconnected: ${socket.id}`);
-        
+
         if (socket.isManager) {
             managerSocket = null;
         }
-        
-        if (socket.isAgent) {
-            availableAgents = availableAgents.filter(a => a.id !== socket.id);
-            console.log(`🗑️ Agent ${socket.agentName} removed. Pool: ${availableAgents.length}`);
-        }
-        
+
         // Clean up pending device
-        if (pendingDevices.has(socket.id)) {
-            pendingDevices.delete(socket.id);
+        const stableDeviceId = socketToDeviceId.get(socket.id) || socket.id;
+        if (pendingDevices.has(stableDeviceId)) {
+            pendingDevices.delete(stableDeviceId);
             if (managerSocket) {
-                managerSocket.emit('device-disconnected', { deviceId: socket.id });
+                managerSocket.emit('device-disconnected', { deviceId: stableDeviceId });
             }
         }
-        
-        deviceAssignments.delete(socket.id);
+
+        deviceAssignments.delete(stableDeviceId);
+        socketToDeviceId.delete(socket.id);
+        deviceIdToSocketId.delete(stableDeviceId);
+    });
+
+    // --- CLIENT MESSAGE ---
+    socket.on("client-message", (data) => {
+        const stableDeviceId = socketToDeviceId.get(socket.id) || socket.id;
+        if (managerSocket) {
+            managerSocket.emit("client-message", {
+                deviceId: socket.id,
+                stableUserId: stableDeviceId,
+                message: data.message
+            });
+        }
+    });
+
+    // --- MANAGER RESPONSE ---
+    socket.on("server-message", (data) => {
+        const { deviceId, message } = data;
+
+        const deviceSocket = io.sockets.sockets.get(deviceId);
+        if (deviceSocket) {
+            deviceSocket.emit("server-message", { message });
+        }
     });
 });
-
-function matchAgentToDevice(agentSocket, agentInfo, deviceId) {
-    const assignment = deviceAssignments.get(deviceId);
-    if (!assignment) return;
-    
-    const deviceSocket = io.sockets.sockets.get(deviceId);
-    if (!deviceSocket) {
-        console.log(`❌ Device ${deviceId} gone`);
-        return;
-    }
-    
-    const roomId = assignment.roomId;
-    
-    agentSocket.join(roomId);
-    deviceSocket.join(roomId);
-    
-    agentSocket.emit('agent-connected', { 
-        roomId: roomId, 
-        clientId: deviceId 
-    });
-    
-    deviceSocket.emit('agent-connected', {
-        roomId: roomId,
-        agentName: agentInfo.name
-    });
-    
-    console.log(`🤝 ${agentInfo.name} connected to device ${deviceId}`);
-}
 
 io.listen(port);
 console.log(`🚀 Dextral Relay Server running on port ${port}`);
