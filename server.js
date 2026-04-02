@@ -1,5 +1,5 @@
 const { Server } = require("socket.io");
-const port = process.env.PORT || 3000;
+const port = Number(process.env.PORT || 3000);
 const io = new Server({
     cors: {
         origin: "*",
@@ -16,6 +16,7 @@ const deviceIdToSocketId = new Map();
 
 // Manager socket
 let managerSocket = null;
+const managerSocketIds = new Set();
 
 // Pending devices waiting for agent assignment
 const pendingDevices = new Map();
@@ -26,7 +27,7 @@ io.on("connection", (socket) => {
     // --- MANAGER LOGIC ---
     socket.on('manager-register', () => {
         managerSocket = socket;
-        socket.isManager = true;
+        managerSocketIds.add(socket.id);
         console.log(`📋 Manager registered: ${socket.id}`);
 
         // Send any pending devices
@@ -149,9 +150,10 @@ io.on("connection", (socket) => {
     socket.on("disconnect", () => {
         console.log(`❌ Disconnected: ${socket.id}`);
 
-        if (socket.isManager) {
+        if (managerSocketIds.has(socket.id)) {
             managerSocket = null;
         }
+        managerSocketIds.delete(socket.id);
 
         // Clean up pending device
         const stableDeviceId = socketToDeviceId.get(socket.id) || socket.id;
