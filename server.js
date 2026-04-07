@@ -92,7 +92,7 @@ io.on("connection", (socket) => {
 
     // --- MANAGER: ASSIGN AGENT ---
     socket.on('assign-agent', (data) => {
-        const { deviceId, agentName } = data;
+        const { deviceId, agentName, djUrl } = data;
 
         if (!pendingDevices.has(deviceId)) {
             console.log(`❌ No pending device: ${deviceId}`);
@@ -114,13 +114,15 @@ io.on("connection", (socket) => {
         // Store assignment
         deviceAssignments.set(deviceId, {
             agentName: agentName,
-            roomId: roomId
+            roomId: roomId,
+            djUrl: djUrl || null
         });
 
-        // Notify device
+        // Notify device — include djUrl so it can talk directly to the DJ
         deviceSocket.emit('agent-assigned', {
             agentName: agentName,
             roomId: roomId,
+            djUrl: djUrl || null,
             message: `You're being connected to ${agentName}`
         });
 
@@ -177,6 +179,18 @@ io.on("connection", (socket) => {
                 deviceId: socket.id,
                 stableUserId: stableDeviceId,
                 message: data.message
+            });
+        }
+    });
+
+    // --- CLIENT DATA ---
+    socket.on("client-data", (data) => {
+        const stableDeviceId = socketToDeviceId.get(socket.id) || socket.id;
+        if (managerSocket) {
+            managerSocket.emit("client-data", {
+                deviceId: socket.id,
+                stableUserId: stableDeviceId,
+                ...data
             });
         }
     });
